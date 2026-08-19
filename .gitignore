@@ -3,4 +3,5 @@ state/
 logs/
 backups/
 *.secret
+testResults.xml
 
