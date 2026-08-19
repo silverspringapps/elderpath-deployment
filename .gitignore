@@ -1,0 +1,6 @@
+config/deployment.env
+state/
+logs/
+backups/
+*.secret
+
