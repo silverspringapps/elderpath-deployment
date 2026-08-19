@@ -138,7 +138,7 @@ If an earlier run created an empty `staging` GitHub environment, it is intention
 
 Keep the official California source URL unless the authoritative publisher changes it. Set `NOMINATIM_USER_AGENT` to a real ElderPath identifier with your monitored contact email.
 
-Statewide coordinates use a one-time Geocodio batch (`GEOCODER_PROVIDER=geocodio` only on `geocode-california-initial`). Store API keys in Secret Manager names `STATECARE_STAGING_GEOCODIO_API_KEY_SECRET` and `STATECARE_PRODUCTION_GEOCODIO_API_KEY_SECRET`; never put the key in Worker vars, checkpoints, or GitHub Secrets. Quality requires accuracy >= 0.8 and rooftop/point/range_interpolation/nearest_rooftop_match. City/county/state centroids are rejected. Coverage must be at least 99% of current California facilities or the run fails closed.
+Statewide coordinates use a one-time Geocodio batch (`GEOCODER_PROVIDER=geocodio` only on `geocode-california-initial`). Store API keys in Secret Manager names `STAGING_GEOCODIO_API_KEY_SECRET` and `PRODUCTION_GEOCODIO_API_KEY_SECRET` in `deployment.env`; never put the API key itself in that file, Worker vars, checkpoints, or GitHub Secrets. If the Secret Manager resources are missing, Provision, DeployStaging, DeployProduction, and GeocodeCalifornia securely prompt for each key and upload it. Quality requires accuracy >= 0.8 and rooftop/point/range_interpolation/nearest_rooftop_match. City/county/state centroids are rejected. Coverage must be at least 99% of current California facilities or the run fails closed.
 
 Later license/address deltas use public Nominatim on `geocode-california-delta` only: California scope, 100 rows per run, 4 requests/minute. The API, import, Menifee, and Southern California jobs stay on Nominatim and do not receive the Geocodio secret. StateCare deploy itself applies code and migrations only; it does not execute import or geocode jobs.
 
@@ -220,6 +220,11 @@ Later explicit `-Phase GeocodeCalifornia` runs import plus the public-Nominatim 
 (<=100 pending, 4 req/min). `-Phase All` after a completed initial checkpoint does not re-run
 delta. Resume detects `PausedAt=GeocodeCalifornia` and returns to this phase. Dry-run never
 stores Geocodio keys in checkpoints.
+
+If an earlier StateCare deploy completed before the California Geocodio jobs existed, rerunning
+`-Phase DeployStaging` or `-Phase DeployProduction` recreates the missing Cloud Run jobs even when
+the StateCare checkpoint is already complete. After the jobs exist, run `-Phase GeocodeCalifornia`
+once; it processes staging and production in one pass.
 
 GitHub Actions `deploy.yml` needs the Secret Manager resource name, not the API key.
 ConfigureCI writes repository variables `STATECARE_STAGING_GEOCODIO_API_KEY_SECRET` and

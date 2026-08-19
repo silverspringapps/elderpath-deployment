@@ -514,12 +514,28 @@ Describe 'GitHub Free private-repository deployment' {
             { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-StateCareDeploy' },
             $true
         ).Extent.Text
+        $script:DeployStagingFunction = $ast.Find(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-DeployStagingPhase' },
+            $true
+        ).Extent.Text
+        $script:DeployProductionFunction = $ast.Find(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-DeployProductionPhase' },
+            $true
+        ).Extent.Text
         $script:GeocodeCaliforniaFunction = $ast.Find(
             { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-GeocodeCaliforniaEnvironment' },
             $true
         ).Extent.Text
         $script:GeocodeCaliforniaPhaseFunction = $ast.Find(
             { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-GeocodeCaliforniaPhase' },
+            $true
+        ).Extent.Text
+        $script:ProvisionPhaseFunction = $ast.Find(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-ProvisionPhase' },
+            $true
+        ).Extent.Text
+        $script:EnsureGeocodioSecretFunction = $ast.Find(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Ensure-GeocodioSecretReady' },
             $true
         ).Extent.Text
         $script:AllPhaseFunction = $ast.Find(
@@ -599,13 +615,33 @@ Describe 'GitHub Free private-repository deployment' {
         $script:RequestedPhaseFunction | Should -Match "'GeocodeCalifornia'\{Invoke-ValidatePhase;Invoke-GeocodeCaliforniaPhase\}"
         $script:RequestedPhaseFunction | Should -Match "PausedAt -eq 'GeocodeCalifornia'"
         $script:StateCareDeployFunction | Should -Not -Match "'jobs','execute'"
+        $script:StateCareDeployFunction | Should -Match 'Ensure-GeocodioSecretReady \$EnvironmentName'
+        $script:StateCareDeployFunction | Should -Match 'Assert-StateCareRequiredJobsPresent \$EnvironmentName'
+        $script:GeocodeCaliforniaFunction | Should -Match 'Assert-StateCareGeocodeJobsReady \$EnvironmentName'
         $script:GeocodeCaliforniaFunction | Should -Match 'geocode-california-initial'
         $script:GeocodeCaliforniaFunction | Should -Match 'geocode-california-delta'
         $script:GeocodeCaliforniaFunction | Should -Not -Match 'GEOCODIO_API_KEY='
         $script:GeocodeCaliforniaPhaseFunction | Should -Match 'statecare\.california-geocode\.\$environmentName\.v1'
         $script:AllPhaseFunction | Should -Match 'Invoke-DeployProductionPhase[\s\S]*Invoke-GeocodeCaliforniaPhase'
+        $script:EnsureGeocodioSecretFunction | Should -Match 'Get-SensitiveValue -Name \$configurationKey -Prompt'
+        $script:EnsureGeocodioSecretFunction | Should -Match 'Ensure-GcpSecret -Name \$secretName -InitialValue \$value'
+        $script:EnsureGeocodioSecretFunction | Should -Match 'Ensure-GeocodioSecretAccessor \$secretName'
+        $script:ProvisionPhaseFunction | Should -Match "foreach \(\`$environmentName in @\('staging','production'\)\) \{[\s\S]*Ensure-GeocodioSecretReady"
+        $script:DeploymentSource | Should -Not -Match 'add the secret manually before deploying StateCare'
         $script:DeploymentSource | Should -Match 'STAGING_GEOCODIO_API_KEY_SECRET'
         $script:DeploymentSource | Should -Match 'Read-EPSecureValue'
+    }
+
+    It 'redeploys StateCare when California Cloud Run jobs are missing despite completed checkpoints' {
+        $script:DeployStagingFunction | Should -Match 'Invoke-StateCareDeployStep ''staging'' ''deploy\.statecare\.staging'''
+        $script:DeployProductionFunction | Should -Match 'Get-MissingStateCareRequiredJobs ''production'''
+        $script:DeployProductionFunction | Should -Match 'Redeploying StateCare only'
+        $script:DeploymentSource | Should -Match 'geocode-california-initial'
+        $script:DeploymentSource | Should -Match 'function Get-MissingStateCareRequiredJobs'
+        $script:DeploymentSource | Should -Match '\[System\.Collections\.Generic\.List\[string\]\]'
+        $script:DeploymentSource | Should -Match 'return \[string\[\]\]'
+        $script:DeploymentSource | Should -Match '@\(Get-MissingStateCareRequiredJobs'
+        $script:DeploymentSource | Should -Match 'function Invoke-StateCareDeployStep'
     }
 
     It 'clears the pause and records the activated release SHA after production verification' {

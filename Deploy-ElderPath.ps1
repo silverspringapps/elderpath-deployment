@@ -170,6 +170,97 @@ function Test-GcloudResource([string[]]$Arguments) {
     return (Invoke-Gcloud $Arguments -AllowFailure -NoLogOutput).ExitCode -eq 0
 }
 
+function Test-GcloudRunJobExists([string]$JobName) {
+    return Test-GcloudResource @(
+        'run','jobs','describe',$JobName,'--project',(Get-Cfg 'GCP_PROJECT_ID'),'--region',(Get-Cfg 'GCP_REGION')
+    )
+}
+
+function Get-StateCareRequiredJobNames([string]$EnvironmentName) {
+    $service = Get-Cfg "STATECARE_$($EnvironmentName.ToUpperInvariant())_SERVICE"
+    return @(
+        "$service-migrate",
+        "$service-import-ca-rcfe",
+        "$service-geocode-menifee",
+        "$service-geocode-southern-california",
+        "$service-geocode-california-initial",
+        "$service-geocode-california-delta"
+    )
+}
+
+function Get-MissingStateCareRequiredJobs([string]$EnvironmentName) {
+    if ($script:DryRun) { return [string[]]@() }
+    $missing = [System.Collections.Generic.List[string]]::new()
+    foreach ($job in (Get-StateCareRequiredJobNames $EnvironmentName)) {
+        if (-not (Test-GcloudRunJobExists $job)) { [void]$missing.Add($job) }
+    }
+    return [string[]]$missing.ToArray()
+}
+
+function Test-GeocodioSecretReady([string]$EnvironmentName) {
+    if ($script:DryRun) { return $true }
+    $secretName = Get-Cfg "$($EnvironmentName.ToUpperInvariant())_GEOCODIO_API_KEY_SECRET"
+    if (-not (Test-GcloudResource @('secrets','describe',$secretName,'--project',(Get-Cfg 'GCP_PROJECT_ID')))) {
+        return $false
+    }
+    $versions = Invoke-Gcloud @(
+        'secrets','versions','list',$secretName,'--project',(Get-Cfg 'GCP_PROJECT_ID'),'--filter=state:ENABLED','--format=value(name)'
+    ) -AllowFailure -NoLogOutput
+    return [bool]$versions.StdOut.Trim()
+}
+
+function Ensure-GeocodioSecretAccessor([string]$SecretName) {
+    $project = Get-Cfg 'GCP_PROJECT_ID'
+    $runtime = "$(Get-Cfg 'GCP_RUNTIME_SERVICE_ACCOUNT')@$project.iam.gserviceaccount.com"
+    Invoke-Gcloud @(
+        'secrets','add-iam-policy-binding',$SecretName,'--project',$project,"--member=serviceAccount:$runtime",'--role=roles/secretmanager.secretAccessor','--quiet'
+    ) | Out-Null
+}
+
+function Ensure-GeocodioSecretReady([string]$EnvironmentName) {
+    if ($script:DryRun) { return }
+    if (Test-GeocodioSecretReady $EnvironmentName) { return }
+    $tier = $EnvironmentName.ToUpperInvariant()
+    $configurationKey = "${tier}_GEOCODIO_API_KEY_SECRET"
+    $secretName = Get-Cfg $configurationKey
+    Write-EPLog "$EnvironmentName Geocodio secret '$secretName' is missing or has no enabled version; requesting it securely."
+    $value = Get-SensitiveValue -Name $configurationKey -Prompt "$EnvironmentName Geocodio API key"
+    Ensure-GcpSecret -Name $secretName -InitialValue $value
+    Ensure-GeocodioSecretAccessor $secretName
+}
+
+function Assert-StateCareRequiredJobsPresent([string]$EnvironmentName) {
+    $missing = @(Get-MissingStateCareRequiredJobs $EnvironmentName)
+    if ($missing.Count -gt 0) {
+        throw "$EnvironmentName StateCare deploy finished but required Cloud Run jobs are still missing: $($missing -join ', ')."
+    }
+}
+
+function Assert-StateCareGeocodeJobsReady([string]$EnvironmentName, [switch]$Refresh) {
+    if ($script:DryRun) { return }
+    $service = Get-Cfg "STATECARE_$($EnvironmentName.ToUpperInvariant())_SERVICE"
+    $jobs = @("$service-import-ca-rcfe")
+    $jobs += if ($Refresh) { "$service-geocode-california-delta" } else { "$service-geocode-california-initial" }
+    foreach ($job in $jobs) {
+        if (-not (Test-GcloudRunJobExists $job)) {
+            throw "Cloud Run job '$job' is missing. Run -Phase DeployStaging or -Phase DeployProduction to recreate StateCare jobs, then rerun -Phase GeocodeCalifornia."
+        }
+    }
+    if (-not $Refresh) { Ensure-GeocodioSecretReady $EnvironmentName }
+}
+
+function Invoke-StateCareDeployStep([string]$EnvironmentName, [string]$CheckpointName) {
+    $missingJobs = @(Get-MissingStateCareRequiredJobs $EnvironmentName)
+    if ($missingJobs.Count -gt 0 -and (Test-EPCheckpointComplete -State $script:State -Name $CheckpointName)) {
+        Write-EPLog "$EnvironmentName StateCare checkpoint is complete but required Cloud Run jobs are missing: $($missingJobs -join ', '). Redeploying StateCare."
+        Ensure-GeocodioSecretReady $EnvironmentName
+        Invoke-StateCareDeploy $EnvironmentName
+        if (-not $script:DryRun) { Complete-Step $CheckpointName }
+        return
+    }
+    Invoke-Step $CheckpointName { Invoke-StateCareDeploy $EnvironmentName }
+}
+
 function Ensure-GcpSecret {
     param([string]$Name,[string]$InitialValue,[switch]$ForceNewVersion)
     if (-not (Test-GcloudResource @('secrets','describe',$Name,'--project',(Get-Cfg 'GCP_PROJECT_ID')))) {
@@ -322,14 +413,8 @@ function Invoke-ProvisionPhase {
             $value = Get-SensitiveValue -Name $definition[0] -Prompt $definition[1] -Generate:$definition[2]
             Ensure-GcpSecret -Name $secretName -InitialValue $value
         }
-        foreach ($definition in @(
-            @('STAGING_GEOCODIO_API_KEY_SECRET','Staging Geocodio API key', $false),
-            @('PRODUCTION_GEOCODIO_API_KEY_SECRET','Production Geocodio API key', $false)
-        )) {
-            $secretName = Get-Cfg $definition[0]
-            $value = Get-SensitiveValue -Name $definition[0] -Prompt $definition[1] -Generate:$definition[2]
-            Ensure-GcpSecret -Name $secretName -InitialValue $value
-        }
+        Ensure-GeocodioSecretReady 'staging'
+        Ensure-GeocodioSecretReady 'production'
         $runtime = "$(Get-Cfg 'GCP_RUNTIME_SERVICE_ACCOUNT')@$project.iam.gserviceaccount.com"
         foreach ($secretKey in @(
             'STAGING_DATABASE_URL_SECRET','STAGING_DATABASE_URL_SYNC_SECRET','PRODUCTION_DATABASE_URL_SECRET','PRODUCTION_DATABASE_URL_SYNC_SECRET',
@@ -338,6 +423,9 @@ function Invoke-ProvisionPhase {
         )) {
             Invoke-Gcloud @('secrets','add-iam-policy-binding',(Get-Cfg $secretKey),'--project',$project,"--member=serviceAccount:$runtime",'--role=roles/secretmanager.secretAccessor','--quiet') | Out-Null
         }
+    }
+    foreach ($environmentName in @('staging','production')) {
+        Ensure-GeocodioSecretReady $environmentName
     }
     Invoke-Step 'gcp.deploy-iam' {
         $deploy = "$(Get-Cfg 'GCP_DEPLOY_SERVICE_ACCOUNT')@$project.iam.gserviceaccount.com"
@@ -543,6 +631,7 @@ function Test-SupabaseSize([string]$EnvironmentName) {
 
 function Invoke-StateCareDeploy([string]$EnvironmentName) {
     Test-LatestSupabaseDatabaseSecret $EnvironmentName
+    Ensure-GeocodioSecretReady $EnvironmentName
     [void](Initialize-ReviewedWorktree)
     $repo=Get-ExecutionRepository; $bash=Resolve-EPExecutable @('C:\Program Files\Git\bin\bash.exe','C:\Program Files (x86)\Git\bin\bash.exe')
     $envMap=Get-StateCareEnvironment $EnvironmentName
@@ -550,6 +639,7 @@ function Invoke-StateCareDeploy([string]$EnvironmentName) {
     $envMap.GITHUB_SHA=if($script:DryRun){'dry-run-sha'}else{$shaResult.StdOut.Trim()}
     $scriptPath=(Join-Path $repo 'services\statecare-registry\scripts\deploy_cloud_run.sh').Replace('\','/')
     Invoke-Tool $bash @($scriptPath) -WorkingDirectory $repo -Environment $envMap | Out-Null
+    Assert-StateCareRequiredJobsPresent $EnvironmentName
     $service=Get-Cfg "STATECARE_$($EnvironmentName.ToUpperInvariant())_SERVICE"; $project=Get-Cfg 'GCP_PROJECT_ID';$region=Get-Cfg 'GCP_REGION'
     Invoke-Gcloud @('run','services','update',$service,'--project',$project,'--region',$region,"--min=$(Get-Cfg 'STATECARE_MIN_INSTANCES')","--max=$(Get-Cfg 'STATECARE_MAX_INSTANCES')","--concurrency=$(Get-Cfg 'STATECARE_CONCURRENCY')","--timeout=$(Get-Cfg 'STATECARE_REQUEST_TIMEOUT_SECONDS')s",'--quiet') | Out-Null
     Invoke-Gcloud @('run','jobs','update',"$service-geocode-menifee",'--project',$project,'--region',$region,'--command=python',"--args=-m,scripts.drain_geocoding_queue,--scope,menifee,--mode,delta,--max-items,$(Get-Cfg 'MENIFEE_GEOCODING_LIMIT')",'--quiet') | Out-Null
@@ -581,6 +671,7 @@ function Invoke-StateCareDataVerify([string]$EnvironmentName) {
 }
 
 function Invoke-GeocodeCaliforniaEnvironment([string]$EnvironmentName,[switch]$Refresh) {
+    Assert-StateCareGeocodeJobsReady $EnvironmentName -Refresh:$Refresh
     $service=Get-Cfg "STATECARE_$($EnvironmentName.ToUpperInvariant())_SERVICE"
     $project=Get-Cfg 'GCP_PROJECT_ID'
     $region=Get-Cfg 'GCP_REGION'
@@ -649,14 +740,14 @@ function Test-WorkerDeployment([string]$EnvironmentName) {
 
 function Invoke-PrepareBeforeBindings {
     if(Get-CfgBool 'DEPLOY_STAGING'){
-        Invoke-Step 'deploy.statecare.staging' { Invoke-StateCareDeploy 'staging' }
+        Invoke-StateCareDeployStep 'staging' 'deploy.statecare.staging'
         Initialize-CloudflareToken
         if(-not(Test-EPCheckpointComplete $script:State 'worker.secrets.staging')){Set-WorkerSecrets 'staging';if(-not$script:DryRun){Complete-Step 'worker.secrets.staging'}}
     }
     if(Get-CfgBool 'DEPLOY_PRODUCTION'){
         if(-not$script:DryRun -and -not(Test-EPCheckpointComplete $script:State 'deploy.statecare.staging')){throw 'Staging StateCare must pass before preparing production.'}
         if(-not(Test-EPCheckpointComplete $script:State 'deploy.statecare.production') -and -not$script:DryRun){Request-EPTypedConfirmation 'PREPARE PRODUCTION' 'Deploy the production StateCare revision and prepare Worker secrets before the bindings PR.'}
-        Invoke-Step 'deploy.statecare.production' { Invoke-StateCareDeploy 'production' }
+        Invoke-StateCareDeployStep 'production' 'deploy.statecare.production'
         Initialize-CloudflareToken
         if(-not(Test-EPCheckpointComplete $script:State 'worker.secrets.production')){Set-WorkerSecrets 'production';if(-not$script:DryRun){Complete-Step 'worker.secrets.production'}}
     }
@@ -664,14 +755,29 @@ function Invoke-PrepareBeforeBindings {
 
 function Invoke-DeployStagingPhase {
     if(-not(Get-CfgBool 'DEPLOY_STAGING')){Write-EPLog 'Staging deployment disabled.';return}
-    Invoke-Step 'deploy.statecare.staging' { Invoke-StateCareDeploy 'staging' }
+    Invoke-StateCareDeployStep 'staging' 'deploy.statecare.staging'
     Invoke-Step 'deploy.worker.staging' { Invoke-WorkerDeploy 'staging' }
 }
 
 function Invoke-DeployProductionPhase {
     if(-not(Get-CfgBool 'DEPLOY_PRODUCTION')){Write-EPLog 'Production deployment disabled.';return}
-    if((Test-EPCheckpointComplete $script:State 'deploy.statecare.production') -and (Test-EPCheckpointComplete $script:State 'deploy.worker.production')){Write-EPLog 'Production deployment checkpoints are already complete.';return}
-    if(-not$script:DryRun -and -not(Test-EPCheckpointComplete $script:State 'deploy.worker.staging')){throw 'Successful staging deployment is required before production.'}
+    $missingJobs = @(Get-MissingStateCareRequiredJobs 'production')
+    $stateCareComplete = Test-EPCheckpointComplete $script:State 'deploy.statecare.production'
+    $workerComplete = Test-EPCheckpointComplete $script:State 'deploy.worker.production'
+    if ($stateCareComplete -and $workerComplete -and $missingJobs.Count -eq 0) {
+        Write-EPLog 'Production deployment checkpoints are already complete.'
+        return
+    }
+    if (-not $script:DryRun -and -not (Test-EPCheckpointComplete $script:State 'deploy.worker.staging')) {
+        throw 'Successful staging deployment is required before production.'
+    }
+    if ($missingJobs.Count -gt 0 -and $stateCareComplete -and $workerComplete) {
+        Write-EPLog "Production StateCare checkpoint is complete but required Cloud Run jobs are missing: $($missingJobs -join ', '). Redeploying StateCare only."
+        Ensure-GeocodioSecretReady 'production'
+        Invoke-StateCareDeploy 'production'
+        if (-not $script:DryRun) { Complete-Step 'deploy.statecare.production' }
+        return
+    }
     if(-not $script:DryRun){Request-EPTypedConfirmation 'DEPLOY PRODUCTION' 'Production migrations and deployment are about to run.'}
     Initialize-CloudflareToken
     Invoke-Step 'production.rollback-capture' {
@@ -680,7 +786,7 @@ function Invoke-DeployProductionPhase {
         $bookmark=Invoke-Wrangler @('d1','time-travel','info',(Get-Cfg 'CLOUDFLARE_PRODUCTION_D1_NAME'),'--env','production','--remote') -AllowFailure
         $script:State.Resources['D1RecoveryBookmark']=(Protect-EPText $bookmark.StdOut.Trim())
     }
-    Invoke-Step 'deploy.statecare.production' { Invoke-StateCareDeploy 'production' }
+    Invoke-StateCareDeployStep 'production' 'deploy.statecare.production'
     Invoke-Step 'deploy.worker.production' { Invoke-WorkerDeploy 'production'; $envMap=@{DEPLOYMENT_URL="https://$(Get-Cfg 'PRODUCTION_APP_HOST')"}; Invoke-Npm @('run','smoke:production') -Environment $envMap|Out-Null }
 }
 
