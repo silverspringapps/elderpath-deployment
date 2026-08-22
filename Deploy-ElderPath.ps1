@@ -1,6 +1,6 @@
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact='High')]
 param(
-    [ValidateSet('Validate','Provision','RepairDatabaseSecrets','ConfigureCI','ConfigureCloudflare','ConfigureReleaseTopology','DeployStaging','DeployProduction','CreateBindingsPR','CleanupAccidentalR2','Monitoring','GeocodeCalifornia','PromoteAdmin','All','Resume')]
+    [ValidateSet('Validate','Provision','RepairDatabaseSecrets','ConfigureCI','ConfigureCloudflare','ConfigureReleaseTopology','ManualRelease','DeployStaging','DeployProduction','CreateBindingsPR','CleanupAccidentalR2','Monitoring','GeocodeCalifornia','PromoteAdmin','All','Resume')]
     [string]$Phase = 'Validate',
     [string]$ConfigurationPath = (Join-Path $PSScriptRoot 'config\deployment.env'),
     [switch]$RotateSecrets,
@@ -117,7 +117,7 @@ function Assert-RepositoryReady {
     if (-not $script:DryRun -and (Get-CfgBool 'CONFIGURE_GITHUB_CI')) {
         $workflowResult = Invoke-Tool 'git.exe' @('show',"${remoteRef}:.github/workflows/deploy.yml") -WorkingDirectory $repo -NoLogOutput
         $workflow = $workflowResult.StdOut
-        $requiredMarkers = @('workflow_run:','branches: [dev, main]','STATECARE_REGISTRY_API_KEY_SHARED','CLOUDFLARE_API_TOKEN_PRODUCTION')
+        $requiredMarkers = @('workflow_run:','branches: [dev, main]','STATECARE_REGISTRY_API_KEY_STAGING','STATECARE_REGISTRY_API_KEY_PRODUCTION','CLOUDFLARE_API_TOKEN_PRODUCTION')
         foreach ($marker in $requiredMarkers) {
             if (-not $workflow.Contains($marker)) {
                 throw "The GitHub Free private-repository deployment workflow is not present on $remoteRef. Merge the reviewed unified deployment workflow before rerunning the toolkit."
@@ -368,6 +368,29 @@ function Get-GcpSecret([string]$Name) {
     return $value
 }
 
+function Resolve-StateCareServiceUrl(
+    [ValidateSet('staging','production')][string]$EnvironmentName,
+    [switch]$AllowMissing
+) {
+    $existing = [string]$script:State.Resources["${EnvironmentName}StateCareUrl"]
+    if ($existing) { return $existing }
+    $service = Get-Cfg "STATECARE_$($EnvironmentName.ToUpperInvariant())_SERVICE"
+    $result = Invoke-Gcloud @(
+        'run','services','describe',$service,
+        '--project',(Get-Cfg 'GCP_PROJECT_ID'),
+        '--region',(Get-Cfg 'GCP_REGION'),
+        '--format=value(status.url)'
+    ) -NoLogOutput -AllowFailure:$AllowMissing
+    if (-not $script:DryRun -and $result.ExitCode -ne 0) {
+        if ($AllowMissing) { return '' }
+        throw "Unable to resolve the $EnvironmentName StateCare service URL."
+    }
+    $url = if ($script:DryRun) { "https://$service.$(Get-Cfg 'GCP_REGION').run.invalid" } else { $result.StdOut.Trim() }
+    if ($url -notmatch '^https://[^/]+$') { throw "Unable to resolve the $EnvironmentName StateCare service URL." }
+    $script:State.Resources["${EnvironmentName}StateCareUrl"] = $url
+    return $url
+}
+
 function Invoke-ProvisionPhase {
     $project = Get-Cfg 'GCP_PROJECT_ID'; $region = Get-Cfg 'GCP_REGION'
     Invoke-Step 'gcp.project' {
@@ -502,6 +525,14 @@ function Invoke-ConfigureCIPhase {
             STATECARE_PRODUCTION_GEOCODIO_API_KEY_SECRET=Get-Cfg 'PRODUCTION_GEOCODIO_API_KEY_SECRET'
             STATECARE_STAGING_VERIFY_ENABLED='false'
             STATECARE_PRODUCTION_VERIFY_ENABLED='false'
+        }
+        foreach ($environmentName in @('staging','production')) {
+            $url = Resolve-StateCareServiceUrl $environmentName -AllowMissing
+            if ($url) {
+                $variables["STATECARE_REGISTRY_URL_$($environmentName.ToUpperInvariant())"] = $url
+            } else {
+                Write-EPLog "$environmentName StateCare service does not exist yet; ConfigureReleaseTopology or ManualRelease will set its repository URL after deployment." -Level WARN
+            }
         }
         foreach ($pair in $variables.GetEnumerator()) {
             Invoke-Gh @('variable','set',$pair.Key,'--repo',$repoSlug,'--body',[string]$pair.Value) | Out-Null
@@ -913,7 +944,7 @@ function Assert-ReleaseTopologyBranchState {
         throw "$dev is not an ancestor of $main. Resolve branch divergence through a reviewed pull request before configuring release topology."
     }
     $workflow = (Invoke-ReadOnlyTool 'git.exe' @('show',"${main}:.github/workflows/deploy.yml") -WorkingDirectory $repo -NoLogOutput).StdOut
-    foreach ($marker in @('branches: [dev, main]','STATECARE_REGISTRY_URL_SHARED','exact Git tree','head_branch == ''dev''')) {
+    foreach ($marker in @('branches: [dev, main]','STATECARE_REGISTRY_URL_STAGING','STATECARE_REGISTRY_URL_PRODUCTION','exact Git tree','head_branch == ''dev''')) {
         if (-not $workflow.Contains($marker)) { throw "The reviewed dev/main deployment workflow is missing '$marker' on $main." }
     }
     $wrangler = (Invoke-ReadOnlyTool 'git.exe' @('show',"${main}:wrangler.jsonc") -WorkingDirectory $repo -NoLogOutput).StdOut
@@ -926,29 +957,32 @@ function Assert-ReleaseTopologyBranchState {
 function Invoke-ConfigureReleaseTopologyPhase {
     $branches = Assert-ReleaseTopologyBranchState
     $owner = Get-Cfg 'GITHUB_OWNER'; $repository = Get-Cfg 'GITHUB_REPOSITORY'; $slug = "$owner/$repository"
-    $project = Get-Cfg 'GCP_PROJECT_ID'; $region = Get-Cfg 'GCP_REGION'; $service = Get-Cfg 'STATECARE_PRODUCTION_SERVICE'
-    $urlResult = Invoke-Gcloud @('run','services','describe',$service,'--project',$project,'--region',$region,'--format=value(status.url)') -NoLogOutput
-    $registryUrl = if ($script:DryRun) { "https://$service.$region.run.invalid" } else { $urlResult.StdOut.Trim() }
-    if ($registryUrl -notmatch '^https://[^/]+$') { throw 'Unable to resolve the canonical production StateCare service URL.' }
-    $registryKey = Get-GcpSecret (Get-Cfg 'PRODUCTION_REGISTRY_KEY_SECRET')
+    $stagingRegistryUrl = Resolve-StateCareServiceUrl 'staging'
+    $productionRegistryUrl = Resolve-StateCareServiceUrl 'production'
+    $stagingRegistryKey = Get-GcpSecret (Get-Cfg 'STAGING_REGISTRY_KEY_SECRET')
+    $productionRegistryKey = Get-GcpSecret (Get-Cfg 'PRODUCTION_REGISTRY_KEY_SECRET')
 
     Invoke-Step 'release-topology.repository-values.v1' {
         foreach ($pair in ([ordered]@{
             STAGING_DEPLOYMENT_URL='https://elderpath-staging.elderpath.workers.dev'
             PRODUCTION_DEPLOYMENT_URL='https://elderpath.ai'
-            STATECARE_REGISTRY_URL_SHARED=$registryUrl
+            STATECARE_REGISTRY_URL_STAGING=$stagingRegistryUrl
+            STATECARE_REGISTRY_URL_PRODUCTION=$productionRegistryUrl
         }).GetEnumerator()) {
             Invoke-Gh @('variable','set',$pair.Key,'--repo',$slug,'--body',[string]$pair.Value) | Out-Null
         }
-        Invoke-Gh @('secret','set','STATECARE_REGISTRY_API_KEY_SHARED','--repo',$slug) -InputText $registryKey -NoLogOutput | Out-Null
+        Invoke-Gh @('secret','set','STATECARE_REGISTRY_API_KEY_STAGING','--repo',$slug) -InputText $stagingRegistryKey -NoLogOutput | Out-Null
+        Invoke-Gh @('secret','set','STATECARE_REGISTRY_API_KEY_PRODUCTION','--repo',$slug) -InputText $productionRegistryKey -NoLogOutput | Out-Null
     }
 
     Invoke-Step 'release-topology.worker-secrets.v1' {
         Initialize-CloudflareToken
         Set-WorkerSecret 'staging' 'BETTER_AUTH_URL' 'https://elderpath-staging.elderpath.workers.dev'
-        Set-WorkerSecret 'staging' 'STATECARE_REGISTRY_URL' $registryUrl
-        Set-WorkerSecret 'staging' 'STATECARE_REGISTRY_API_KEY' $registryKey
+        Set-WorkerSecret 'staging' 'STATECARE_REGISTRY_URL' $stagingRegistryUrl
+        Set-WorkerSecret 'staging' 'STATECARE_REGISTRY_API_KEY' $stagingRegistryKey
         Set-WorkerSecret 'production' 'BETTER_AUTH_URL' 'https://elderpath.ai'
+        Set-WorkerSecret 'production' 'STATECARE_REGISTRY_URL' $productionRegistryUrl
+        Set-WorkerSecret 'production' 'STATECARE_REGISTRY_API_KEY' $productionRegistryKey
     }
 
     $mainSha = (Invoke-ReadOnlyTool 'git.exe' @('rev-parse',$branches.MainRef) -WorkingDirectory $branches.Repository -NoLogOutput).StdOut.Trim()
@@ -978,6 +1012,158 @@ function Invoke-ConfigureReleaseTopologyPhase {
     $script:State.PausedAt = $null
     Complete-Step "release-topology.release.$mainSha"
     Write-EPLog 'Release topology is active: dev deploys staging and identical staged main trees deploy production automatically.'
+}
+
+function Assert-ManualReleaseWorkflowsDisabled {
+    if (Get-CfgBool 'CONFIGURE_GITHUB_CI') {
+        throw 'ManualRelease requires CONFIGURE_GITHUB_CI=false while the GitHub Actions quota is exhausted.'
+    }
+    $slug = "$(Get-Cfg 'GITHUB_OWNER')/$(Get-Cfg 'GITHUB_REPOSITORY')"
+    foreach ($workflow in @('CI','Deploy')) {
+        if ($script:DryRun) {
+            Write-EPLog "WHATIF verify GitHub workflow '$workflow' is disabled_manually"
+            continue
+        }
+        $result = Invoke-Gh @('workflow','view',$workflow,'--repo',$slug,'--json','state','--jq','.state') -NoLogOutput
+        $state = $result.StdOut.Trim()
+        if ($state -ne 'disabled_manually') {
+            throw "GitHub workflow '$workflow' is '$state'. Disable both CI and Deploy before ManualRelease to avoid consuming Actions quota."
+        }
+    }
+}
+
+function Get-ManualReleaseSelection {
+    $repository = Get-Cfg 'ELDERPATH_REPO_PATH'
+    $main = "origin/$(Get-Cfg 'GITHUB_DEFAULT_BRANCH')"
+    $dev = "origin/$(Get-Cfg 'GITHUB_STAGING_BRANCH')"
+    if (-not $script:DryRun) {
+        Invoke-Tool 'git.exe' @('fetch','origin',(Get-Cfg 'GITHUB_DEFAULT_BRANCH'),(Get-Cfg 'GITHUB_STAGING_BRANCH'),'--prune') -WorkingDirectory $repository | Out-Null
+    }
+    $mainSha = (Invoke-ReadOnlyTool 'git.exe' @('rev-parse',$main) -WorkingDirectory $repository -NoLogOutput).StdOut.Trim()
+    $mainTree = (Invoke-ReadOnlyTool 'git.exe' @('rev-parse',"$main^{tree}") -WorkingDirectory $repository -NoLogOutput).StdOut.Trim()
+    $devTree = (Invoke-ReadOnlyTool 'git.exe' @('rev-parse',"$dev^{tree}") -WorkingDirectory $repository -NoLogOutput).StdOut.Trim()
+    if ($mainSha -notmatch '^[0-9a-fA-F]{40}$') { throw "Unable to resolve a full release SHA from $main." }
+    if ($mainTree -ne $devTree) {
+        throw 'origin/dev and origin/main do not have identical Git trees. Promote the reviewed dev tree to main before ManualRelease.'
+    }
+    $script:State.Resources['ReleaseSha'] = $mainSha
+    Write-EPLog "Manual release selected origin/main commit $mainSha with an identical dev tree."
+    return $mainSha
+}
+
+function Test-StateCareCoverage([ValidateSet('staging','production')][string]$EnvironmentName) {
+    if ($script:DryRun) {
+        Write-EPLog "WHATIF verify $EnvironmentName StateCare current California count and coordinate coverage >= $(Get-Cfg 'STATEWIDE_GEOCODING_REQUIRED_COVERAGE_PERCENT')%"
+        return [pscustomobject]@{ Current=12522; Located=12469; Coverage=99.577 }
+    }
+    $tier = $EnvironmentName.ToUpperInvariant()
+    $url = Get-GcpSecret (Get-Cfg "${tier}_DATABASE_URL_SYNC_SECRET")
+    $uri = [uri]$url
+    $credentials = [uri]::UnescapeDataString($uri.UserInfo).Split(':',2)
+    if ($credentials.Count -ne 2) { throw "$EnvironmentName Supabase sync URL credentials are malformed." }
+    Add-EPRedaction $credentials[1]
+    $query = "SELECT count(*) FILTER (WHERE latitude IS NOT NULL AND longitude IS NOT NULL), count(*) FROM facilities WHERE is_current = true AND state_code = 'CA';"
+    $result = Invoke-Tool 'docker.exe' @(
+        'run','--rm','-e','PGPASSWORD','-e','PGSSLMODE','postgres:17-alpine','psql',
+        '-h',$uri.Host,'-p',([string]$uri.Port),'-U',$credentials[0],'-d',$uri.AbsolutePath.TrimStart('/'),
+        '-At','-F','|','-c',$query
+    ) -Environment @{ PGPASSWORD=$credentials[1]; PGSSLMODE='require' } -NoLogOutput
+    $parts = $result.StdOut.Trim().Split('|')
+    if ($parts.Count -ne 2) { throw "$EnvironmentName StateCare coverage query returned an unexpected result." }
+    $located = [long]$parts[0]
+    $current = [long]$parts[1]
+    if ($current -le 0) { throw "$EnvironmentName StateCare has no current California records." }
+    $coverage = [math]::Round(($located * 100.0) / $current,3)
+    $required = [double](Get-Cfg 'STATEWIDE_GEOCODING_REQUIRED_COVERAGE_PERCENT')
+    Write-EPLog "$EnvironmentName StateCare coverage: $located of $current current California facilities located ($coverage%)."
+    if ($coverage -lt $required) {
+        throw "$EnvironmentName StateCare coverage is $coverage%, below the $required% gate. Stop and run the existing $EnvironmentName Geocodio initial operation; ManualRelease will not import or geocode automatically."
+    }
+    return [pscustomobject]@{ Current=$current; Located=$located; Coverage=$coverage }
+}
+
+function Test-WorkerRegistryDiagnostics([ValidateSet('staging','production')][string]$EnvironmentName) {
+    $url = "https://$(Get-Cfg "$($EnvironmentName.ToUpperInvariant())_APP_HOST")"
+    if ($script:DryRun) { Write-EPLog "WHATIF verify $url uses the $EnvironmentName Registry without a temporary-unavailability response"; return }
+    $response = Invoke-WebRequest -Uri "$url/api/facilities/search?lat=33.6971&lng=-117.1853&radiusMiles=15&locationLabel=Menifee%2C%20California&limit=5" -UseBasicParsing
+    $payload = $response.Content | ConvertFrom-Json
+    if ([string]$payload.sourceDiagnostics.registry -ne 'ok') {
+        throw "$EnvironmentName Worker Registry diagnostics are '$($payload.sourceDiagnostics.registry)' instead of 'ok'."
+    }
+    if ($response.Content -match 'State licensing registry is temporarily unavailable') {
+        throw "$EnvironmentName Worker returned the StateCare temporary-unavailability message."
+    }
+}
+
+function Invoke-TaggedWorkerRelease(
+    [ValidateSet('staging','production')][string]$EnvironmentName,
+    [Parameter(Mandatory)][string]$CommitSha
+) {
+    $tier = $EnvironmentName.ToUpperInvariant()
+    $registryUrl = Resolve-StateCareServiceUrl $EnvironmentName
+    $registryKey = Get-GcpSecret (Get-Cfg "${tier}_REGISTRY_KEY_SECRET")
+    Set-WorkerSecret $EnvironmentName 'STATECARE_REGISTRY_URL' $registryUrl
+    Set-WorkerSecret $EnvironmentName 'STATECARE_REGISTRY_API_KEY' $registryKey
+    $migration = if ($EnvironmentName -eq 'production') { 'db:migrate:production' } else { 'db:migrate:staging' }
+    $seed = if ($EnvironmentName -eq 'production') { 'db:seed:production' } else { 'db:seed:staging' }
+    Invoke-Npm @('run',$migration) | Out-Null
+    Invoke-Npm @('run',$seed) | Out-Null
+    $tag = "release-$($CommitSha.Substring(0,12))"
+    $message = "ElderPath release $CommitSha"
+    Invoke-Npm @('run',"deploy:$EnvironmentName",'--','--tag',$tag,'--message',$message) | Out-Null
+    Test-WorkerDeployment $EnvironmentName
+    Invoke-Npm @('run','smoke:browser') -Environment @{ DEPLOYMENT_URL="https://$(Get-Cfg "${tier}_APP_HOST")" } | Out-Null
+    Test-WorkerRegistryDiagnostics $EnvironmentName
+
+    $workerName = if ($EnvironmentName -eq 'production') { 'elderpath-production' } else { 'elderpath-staging' }
+    $versions = Invoke-Wrangler @('versions','list','--name',$workerName,'--json')
+    $deployment = Invoke-Wrangler @('deployments','status','--name',$workerName,'--json')
+    if (-not $script:DryRun -and ($versions.StdOut -notmatch [regex]::Escape($tag) -or $deployment.StdOut -notmatch [regex]::Escape($CommitSha))) {
+        throw "$EnvironmentName Worker active version does not report release tag '$tag' and SHA '$CommitSha'."
+    }
+    Write-EPLog "$EnvironmentName Worker active version is tagged $tag for $CommitSha."
+}
+
+function Invoke-ManualReleasePhase {
+    Assert-ManualReleaseWorkflowsDisabled
+    $releaseSha = Get-ManualReleaseSelection
+    [void](Initialize-ReviewedWorktree)
+    if ($script:DryRun) {
+        Write-EPLog "WHATIF create a temporary detached worktree for exact origin/main release $releaseSha"
+    } else {
+        $worktreeSha = (Invoke-ReadOnlyTool 'git.exe' @('rev-parse','HEAD') -WorkingDirectory (Get-ExecutionRepository) -NoLogOutput).StdOut.Trim()
+        if ($worktreeSha -ne $releaseSha) { throw "Reviewed worktree is $worktreeSha instead of selected release $releaseSha." }
+    }
+    Initialize-CloudflareToken
+
+    $registryCheckpoint = Get-EPReleaseCheckpointName -Category 'manual.registry-preflight' -CommitSha $releaseSha
+    Invoke-Step $registryCheckpoint {
+        $stagingUrl = Resolve-StateCareServiceUrl 'staging'
+        $productionUrl = Resolve-StateCareServiceUrl 'production'
+        if ($stagingUrl -eq $productionUrl) { throw 'Staging and production StateCare service URLs must be different.' }
+        Invoke-StateCareDataVerify 'staging'
+        [void](Test-StateCareCoverage 'staging')
+        Invoke-StateCareDataVerify 'production'
+        [void](Test-StateCareCoverage 'production')
+        Write-EPLog 'Both Registry stacks pass readiness, freshness, current-record, nearby, and 99% coordinate-coverage gates; import and geocoding are skipped.'
+    }
+
+    $stagingCheckpoint = Get-EPReleaseCheckpointName -Category 'manual.worker.staging' -CommitSha $releaseSha
+    Invoke-Step $stagingCheckpoint { Invoke-TaggedWorkerRelease 'staging' $releaseSha }
+    if (-not (Get-CfgBool 'DEPLOY_PRODUCTION')) { return }
+    if (-not $script:DryRun) { Request-EPTypedConfirmation 'DEPLOY PRODUCTION' "Deploy the exact verified origin/main release $releaseSha." }
+
+    $bookmarkCheckpoint = Get-EPReleaseCheckpointName -Category 'manual.production-bookmark' -CommitSha $releaseSha
+    Invoke-Step $bookmarkCheckpoint {
+        $bookmark = Invoke-Wrangler @('d1','time-travel','info',(Get-Cfg 'CLOUDFLARE_PRODUCTION_D1_NAME'),'--env','production','--remote')
+        $script:State.Resources["D1RecoveryBookmark.$releaseSha"] = Protect-EPText $bookmark.StdOut.Trim()
+    }
+    $productionCheckpoint = Get-EPReleaseCheckpointName -Category 'manual.worker.production' -CommitSha $releaseSha
+    Invoke-Step $productionCheckpoint {
+        Invoke-TaggedWorkerRelease 'production' $releaseSha
+        Invoke-Npm @('run','smoke:production') -Environment @{ DEPLOYMENT_URL='https://elderpath.ai' } | Out-Null
+    }
+    Write-EPLog "Manual release $releaseSha is active in staging and production. StateCare was verified but not redeployed, imported, or geocoded."
 }
 
 function Invoke-CleanupAccidentalR2Phase {
@@ -1078,6 +1264,7 @@ function Invoke-RequestedPhase([string]$Requested) {
         'ConfigureCI'{Invoke-ValidatePhase;Invoke-ConfigureCIPhase}
         'ConfigureCloudflare'{Invoke-ValidatePhase;Invoke-ConfigureCloudflarePhase}
         'ConfigureReleaseTopology'{Invoke-ValidatePhase;Invoke-ConfigureReleaseTopologyPhase}
+        'ManualRelease'{Invoke-ValidatePhase;Invoke-ManualReleasePhase}
         'DeployStaging'{Invoke-ValidatePhase;Invoke-DeployStagingPhase}
         'DeployProduction'{Invoke-ValidatePhase;Invoke-DeployProductionPhase}
         'CreateBindingsPR'{Invoke-ValidatePhase;Invoke-CreateBindingsPRPhase}
