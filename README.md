@@ -197,6 +197,7 @@ pwsh .\Deploy-ElderPath.ps1 -Phase RepairDatabaseSecrets
 pwsh .\Deploy-ElderPath.ps1 -Phase ConfigureCI
 pwsh .\Deploy-ElderPath.ps1 -Phase ConfigureCloudflare
 pwsh .\Deploy-ElderPath.ps1 -Phase ConfigureReleaseTopology
+pwsh .\Deploy-ElderPath.ps1 -Phase ManualRelease
 pwsh .\Deploy-ElderPath.ps1 -Phase DeployStaging
 pwsh .\Deploy-ElderPath.ps1 -Phase DeployProduction
 pwsh .\Deploy-ElderPath.ps1 -Phase GeocodeCalifornia
@@ -205,14 +206,34 @@ pwsh .\Deploy-ElderPath.ps1 -Phase Monitoring
 
 `ConfigureReleaseTopology` activates the ongoing branch release model after the reviewed repository
 change is merged. It validates that `dev` is an ancestor of `main`, sets the workers.dev/apex GitHub
-variables, uploads the shared production Registry data key through standard input, and changes only
-the staging auth/Registry secrets plus the production auth origin. It requires
+variables, uploads separate staging and production Registry data keys through standard input, and
+keeps each Worker bound to its matching Cloud Run/Supabase Registry. It changes only the auth
+origin and Registry secrets for each Worker. It requires
 `FAST FORWARD DEV TO MAIN` for the one-time synchronization, waits for dev staging, then runs main CI
 so the identical-tree gate can perform the first automatic apex production release. Its `-WhatIf`
 mode does not contact providers, change branches, write checkpoints, or prompt for secrets.
 If this phase pauses because CI or deployment fails, correct the cause and run `-Phase Resume`.
 Resume detects `PausedAt=ConfigureReleaseTopology`, returns directly to this branch-aware phase,
 reuses completed topology checkpoints, and records the current release SHA after verification.
+
+`ManualRelease` is the temporary quota-exhaustion path. Set `CONFIGURE_GITHUB_CI=false`, disable the
+GitHub `CI` and `Deploy` workflows, complete the application gate locally, and promote an identical
+Git tree through `dev` and `main`. The phase fails closed unless both workflows report
+`disabled_manually` and both remote branches have the same tree. It then:
+
+1. Checks readiness, freshness, a bounded nearby result, current California record counts, and at
+   least 99% coordinate coverage against both environment-specific Registries.
+2. Skips StateCare deployment, import, and geocoding when those gates pass.
+3. Applies idempotent staging D1 migrations/RBAC, deploys and browser-smokes the exact
+   `origin/main` SHA against the staging Registry.
+4. Captures a production D1 Time Travel bookmark, applies production D1 migrations/RBAC, and
+   deploys/smokes the same SHA against the production Registry.
+5. Adds `release-<short-sha>` and the full SHA to each Worker version and verifies the active
+   deployment metadata.
+
+Run it with `pwsh .\Deploy-ElderPath.ps1 -Phase ManualRelease`. Keep the workflows disabled until
+the Actions quota resets. Then set `CONFIGURE_GITHUB_CI=true`, run `-Phase ConfigureCI`, re-enable
+both workflows, and validate one normal identical-tree release.
 
 `GeocodeCalifornia` is the only phase that executes import/geocode jobs. The first run per
 environment performs California RCFE import, the Geocodio initial job, and `statecare:verify`.
@@ -276,7 +297,7 @@ The optional weekly task runs under the current Windows user. The computer must 
 
 ## 7. Verification and rollback
 
-The release gate includes local tests, `npm run statecare:verify`, Cloud Run readiness, PostgreSQL size, Worker `/api/health`, security headers, Riverside landing copy, and production smoke tests. Manually verify signup email delivery, provider/staff authorization, a Menifee search, and that no browser network response exposes StateCare or vendor keys.
+The release gate includes local tests, environment-specific `npm run statecare:verify`, Cloud Run readiness, current-record and coordinate-coverage checks, PostgreSQL size, Worker `/api/health`, Registry diagnostics, hydrated browser navigation, security headers, Riverside landing copy, and production smoke tests. Manually verify signup email delivery, provider/staff authorization, a Menifee search, and that no browser network response exposes StateCare or vendor keys.
 
 Inspect non-secret state and logs here:
 

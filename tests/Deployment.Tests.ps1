@@ -502,6 +502,22 @@ Describe 'GitHub Free private-repository deployment' {
             { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-ConfigureReleaseTopologyPhase' },
             $true
         ).Extent.Text
+        $script:ManualReleaseFunction = $ast.Find(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-ManualReleasePhase' },
+            $true
+        ).Extent.Text
+        $script:ManualWorkflowGuardFunction = $ast.Find(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-ManualReleaseWorkflowsDisabled' },
+            $true
+        ).Extent.Text
+        $script:ManualSelectionFunction = $ast.Find(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ManualReleaseSelection' },
+            $true
+        ).Extent.Text
+        $script:TaggedWorkerReleaseFunction = $ast.Find(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-TaggedWorkerRelease' },
+            $true
+        ).Extent.Text
         $script:ReleaseBranchesFunction = $ast.Find(
             { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-ReleaseTopologyBranchState' },
             $true
@@ -558,7 +574,7 @@ Describe 'GitHub Free private-repository deployment' {
     }
 
     It 'fails closed until the unified workflow is merged into origin main' {
-        foreach ($marker in @('workflow_run:','branches: [dev, main]','STATECARE_REGISTRY_API_KEY_SHARED','CLOUDFLARE_API_TOKEN_PRODUCTION')) {
+        foreach ($marker in @('workflow_run:','branches: [dev, main]','STATECARE_REGISTRY_API_KEY_STAGING','STATECARE_REGISTRY_API_KEY_PRODUCTION','CLOUDFLARE_API_TOKEN_PRODUCTION')) {
             $script:RepositoryReadyFunction | Should -Match ([regex]::Escape($marker))
         }
         $script:RepositoryReadyFunction | Should -Match 'still uses GitHub environments'
@@ -573,16 +589,45 @@ Describe 'GitHub Free private-repository deployment' {
         $script:ConfigureCiFunction | Should -Not -Match "'secret','set'.*'--env'"
     }
 
-    It 'configures the shared Registry and only the four intended Worker secrets' {
-        $script:ReleaseTopologyFunction | Should -Match 'STATECARE_REGISTRY_URL_SHARED'
-        $script:ReleaseTopologyFunction | Should -Match 'STATECARE_REGISTRY_API_KEY_SHARED'
+    It 'configures isolated Registry credentials and only the intended Worker secrets' {
+        $script:ReleaseTopologyFunction | Should -Match 'STATECARE_REGISTRY_URL_STAGING'
+        $script:ReleaseTopologyFunction | Should -Match 'STATECARE_REGISTRY_URL_PRODUCTION'
+        $script:ReleaseTopologyFunction | Should -Match 'STATECARE_REGISTRY_API_KEY_STAGING'
+        $script:ReleaseTopologyFunction | Should -Match 'STATECARE_REGISTRY_API_KEY_PRODUCTION'
+        $script:ReleaseTopologyFunction | Should -Not -Match 'STATECARE_REGISTRY_URL_SHARED|STATECARE_REGISTRY_API_KEY_SHARED'
         $script:ReleaseTopologyFunction | Should -Match "Invoke-Step 'release-topology\.worker-secrets\.v1' \{[\s\S]*Initialize-CloudflareToken"
         $script:ReleaseTopologyFunction | Should -Match "Set-WorkerSecret 'staging' 'BETTER_AUTH_URL'"
         $script:ReleaseTopologyFunction | Should -Match "Set-WorkerSecret 'staging' 'STATECARE_REGISTRY_URL'"
         $script:ReleaseTopologyFunction | Should -Match "Set-WorkerSecret 'staging' 'STATECARE_REGISTRY_API_KEY'"
         $script:ReleaseTopologyFunction | Should -Match "Set-WorkerSecret 'production' 'BETTER_AUTH_URL'"
+        $script:ReleaseTopologyFunction | Should -Match "Set-WorkerSecret 'production' 'STATECARE_REGISTRY_URL'"
+        $script:ReleaseTopologyFunction | Should -Match "Set-WorkerSecret 'production' 'STATECARE_REGISTRY_API_KEY'"
         $script:ReleaseTopologyFunction | Should -Not -Match 'BETTER_AUTH_SECRET|RESEND_API_KEY|OPENAI_API_KEY'
-        $script:ReleaseTopologyFunction | Should -Match "'secret','set','STATECARE_REGISTRY_API_KEY_SHARED'.*-InputText"
+        $script:ReleaseTopologyFunction | Should -Match "'secret','set','STATECARE_REGISTRY_API_KEY_STAGING'.*-InputText"
+        $script:ReleaseTopologyFunction | Should -Match "'secret','set','STATECARE_REGISTRY_API_KEY_PRODUCTION'.*-InputText"
+    }
+
+    It 'guards and scopes manual release to one identical main and dev tree' {
+        $script:RequestedPhaseFunction | Should -Match "'ManualRelease'\{Invoke-ValidatePhase;Invoke-ManualReleasePhase\}"
+        $script:ManualWorkflowGuardFunction | Should -Match "CONFIGURE_GITHUB_CI"
+        $script:ManualWorkflowGuardFunction | Should -Match "disabled_manually"
+        $script:ManualWorkflowGuardFunction | Should -Match "workflow','view"
+        $script:ManualSelectionFunction | Should -Match '\^\{tree\}'
+        $script:ManualSelectionFunction | Should -Match "origin/dev and origin/main do not have identical Git trees"
+        $script:ManualReleaseFunction | Should -Match 'Initialize-ReviewedWorktree'
+        $script:ManualReleaseFunction | Should -Match 'manual\.registry-preflight'
+        $script:ManualReleaseFunction | Should -Match 'manual\.production-bookmark'
+        $script:ManualReleaseFunction | Should -Match 'Invoke-TaggedWorkerRelease ''staging'''
+        $script:ManualReleaseFunction | Should -Match 'Invoke-TaggedWorkerRelease ''production'''
+    }
+
+    It 'tags both Worker releases and verifies the active version metadata' {
+        $script:TaggedWorkerReleaseFunction | Should -Match "'--tag'"
+        $script:TaggedWorkerReleaseFunction | Should -Match "'--message'"
+        $script:TaggedWorkerReleaseFunction | Should -Match "'versions','list'"
+        $script:TaggedWorkerReleaseFunction | Should -Match "'deployments','status'"
+        $script:TaggedWorkerReleaseFunction | Should -Match 'Test-WorkerRegistryDiagnostics'
+        $script:TaggedWorkerReleaseFunction | Should -Not -Match 'BETTER_AUTH_SECRET|RESEND_API_KEY|OPENAI_API_KEY'
     }
 
     It 'requires an ancestor dev branch and exact confirmation before one-time synchronization' {
