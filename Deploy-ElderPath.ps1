@@ -1019,16 +1019,21 @@ function Assert-ManualReleaseWorkflowsDisabled {
         throw 'ManualRelease requires CONFIGURE_GITHUB_CI=false while the GitHub Actions quota is exhausted.'
     }
     $slug = "$(Get-Cfg 'GITHUB_OWNER')/$(Get-Cfg 'GITHUB_REPOSITORY')"
-    foreach ($workflow in @('CI','Deploy')) {
+    foreach ($workflow in @(
+        @{ Name='CI'; Path='ci.yml' },
+        @{ Name='Deploy'; Path='deploy.yml' }
+    )) {
         if ($script:DryRun) {
-            Write-EPLog "WHATIF verify GitHub workflow '$workflow' is disabled_manually"
+            Write-EPLog "WHATIF verify GitHub workflow '$($workflow.Name)' ($($workflow.Path)) is disabled_manually"
             continue
         }
-        $result = Invoke-Gh @('workflow','view',$workflow,'--repo',$slug,'--json','state','--jq','.state') -NoLogOutput
-        $state = $result.StdOut.Trim()
-        if ($state -ne 'disabled_manually') {
-            throw "GitHub workflow '$workflow' is '$state'. Disable both CI and Deploy before ManualRelease to avoid consuming Actions quota."
-        }
+        $endpoint = "repos/$slug/actions/workflows/$($workflow.Path)"
+        $result = Invoke-Gh @('api',$endpoint,'--jq','.state') -AllowFailure -NoLogOutput
+        [void](Assert-EPGitHubWorkflowDisabledState `
+            -WorkflowName $workflow.Name `
+            -WorkflowPath $workflow.Path `
+            -State $result.StdOut `
+            -ExitCode $result.ExitCode)
     }
 }
 
