@@ -757,6 +757,30 @@ function Get-EPReleaseCheckpointName {
     return "$normalizedCategory.$($CommitSha.ToLowerInvariant())"
 }
 
+function Assert-EPGitHubWorkflowDisabledState {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$WorkflowName,
+        [Parameter(Mandatory)][string]$WorkflowPath,
+        [AllowEmptyString()][string]$State,
+        [int]$ExitCode = 0
+    )
+    if ($ExitCode -ne 0) {
+        throw "Unable to verify GitHub workflow '$WorkflowName' ($WorkflowPath) through the GitHub API. Confirm the workflow exists and gh auth status succeeds."
+    }
+    if ([string]::IsNullOrWhiteSpace($State)) {
+        throw "GitHub workflow '$WorkflowName' ($WorkflowPath) returned an empty state. Refusing the manual release."
+    }
+    $normalizedState = $State.Trim()
+    if ($normalizedState -notmatch '^[a-z][a-z_]*$') {
+        throw "GitHub workflow '$WorkflowName' ($WorkflowPath) returned malformed state '$normalizedState'. Refusing the manual release."
+    }
+    if ($normalizedState -ne 'disabled_manually') {
+        throw "GitHub workflow '$WorkflowName' is '$normalizedState'. Disable both CI and Deploy manually before ManualRelease to avoid consuming Actions quota."
+    }
+    return $true
+}
+
 function Invoke-EPR2BucketCleanup {
     [CmdletBinding()]
     param(
@@ -820,5 +844,5 @@ Export-ModuleMember -Function ConvertFrom-EPEnvFile,ConvertTo-EPBoolean,Assert-E
     Get-EPCheckpoint,Save-EPCheckpoint,Set-EPCheckpointComplete,Test-EPCheckpointComplete,
     Request-EPTypedConfirmation,Resolve-EPExecutable,Get-EPPowerShellExecutableStatus,Get-EPBootstrapRelaunchArguments,
     ConvertTo-EPCloudflareDnsRecordBody,Test-EPCloudflareApiErrorCode,ConvertTo-EPSupabaseConnectionUrlSet,
-    Get-EPReleaseCheckpointName,Invoke-EPR2BucketCleanup,
+    Get-EPReleaseCheckpointName,Assert-EPGitHubWorkflowDisabledState,Invoke-EPR2BucketCleanup,
     Invoke-EPValidatedSecretPublication

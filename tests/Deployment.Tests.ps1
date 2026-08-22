@@ -111,6 +111,36 @@ Describe 'Configuration validation' {
     }
 }
 
+Describe 'GitHub manual-release workflow state validation' {
+    It 'accepts a manually disabled workflow' {
+        Assert-EPGitHubWorkflowDisabledState -WorkflowName CI -WorkflowPath ci.yml -State 'disabled_manually' | Should -BeTrue
+    }
+
+    It 'rejects an active workflow' {
+        {
+            Assert-EPGitHubWorkflowDisabledState -WorkflowName Deploy -WorkflowPath deploy.yml -State 'active'
+        } | Should -Throw "*GitHub workflow 'Deploy' is 'active'*"
+    }
+
+    It 'rejects an empty workflow state' {
+        {
+            Assert-EPGitHubWorkflowDisabledState -WorkflowName CI -WorkflowPath ci.yml -State ''
+        } | Should -Throw '*returned an empty state*'
+    }
+
+    It 'rejects a malformed workflow state' {
+        {
+            Assert-EPGitHubWorkflowDisabledState -WorkflowName CI -WorkflowPath ci.yml -State '{not-json}'
+        } | Should -Throw '*returned malformed state*'
+    }
+
+    It 'reports a workflow-specific GitHub API failure' {
+        {
+            Assert-EPGitHubWorkflowDisabledState -WorkflowName Deploy -WorkflowPath deploy.yml -State '' -ExitCode 1
+        } | Should -Throw "*Unable to verify GitHub workflow 'Deploy' (deploy.yml) through the GitHub API*"
+    }
+}
+
 Describe 'Supabase connection validation' {
     BeforeAll {
         $script:PoolerHost = 'aws-0-us-west-1.pooler.supabase.com'
@@ -611,7 +641,11 @@ Describe 'GitHub Free private-repository deployment' {
         $script:RequestedPhaseFunction | Should -Match "'ManualRelease'\{Invoke-ValidatePhase;Invoke-ManualReleasePhase\}"
         $script:ManualWorkflowGuardFunction | Should -Match "CONFIGURE_GITHUB_CI"
         $script:ManualWorkflowGuardFunction | Should -Match "disabled_manually"
-        $script:ManualWorkflowGuardFunction | Should -Match "workflow','view"
+        $script:ManualWorkflowGuardFunction | Should -Match "'api'"
+        $script:ManualWorkflowGuardFunction | Should -Match "actions/workflows/"
+        $script:ManualWorkflowGuardFunction | Should -Match "ci\.yml"
+        $script:ManualWorkflowGuardFunction | Should -Match "deploy\.yml"
+        $script:ManualWorkflowGuardFunction | Should -Not -Match "workflow','view|--json"
         $script:ManualSelectionFunction | Should -Match '\^\{tree\}'
         $script:ManualSelectionFunction | Should -Match "origin/dev and origin/main do not have identical Git trees"
         $script:ManualReleaseFunction | Should -Match 'Initialize-ReviewedWorktree'
