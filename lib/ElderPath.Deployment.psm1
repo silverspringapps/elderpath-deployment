@@ -781,6 +781,35 @@ function Assert-EPGitHubWorkflowDisabledState {
     return $true
 }
 
+function ConvertFrom-EPD1TimeTravelInfo {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Json)
+
+    if ([string]::IsNullOrWhiteSpace($Json)) {
+        throw 'Cloudflare returned no D1 Time Travel information. Production release stopped before migrations.'
+    }
+    try {
+        $result = ConvertFrom-Json -InputObject $Json -NoEnumerate -ErrorAction Stop
+    } catch {
+        throw 'Cloudflare returned malformed D1 Time Travel JSON. Production release stopped before migrations.'
+    }
+    if ($null -eq $result -or $result -is [System.Array]) {
+        throw 'Cloudflare returned malformed D1 Time Travel JSON. Production release stopped before migrations.'
+    }
+    $bookmarkProperty = $result.PSObject.Properties['bookmark']
+    if ($null -eq $bookmarkProperty -or
+        $null -eq $bookmarkProperty.Value -or
+        $bookmarkProperty.Value -isnot [string] -or
+        [string]::IsNullOrWhiteSpace([string]$bookmarkProperty.Value)) {
+        throw 'Cloudflare returned no valid D1 Time Travel bookmark. Production release stopped before migrations.'
+    }
+    $bookmark = ([string]$bookmarkProperty.Value).Trim()
+    if ($bookmark.Length -gt 512 -or $bookmark -match '[\x00-\x1F\x7F]') {
+        throw 'Cloudflare returned a malformed D1 Time Travel bookmark. Production release stopped before migrations.'
+    }
+    return $bookmark
+}
+
 function Invoke-EPR2BucketCleanup {
     [CmdletBinding()]
     param(
@@ -844,5 +873,5 @@ Export-ModuleMember -Function ConvertFrom-EPEnvFile,ConvertTo-EPBoolean,Assert-E
     Get-EPCheckpoint,Save-EPCheckpoint,Set-EPCheckpointComplete,Test-EPCheckpointComplete,
     Request-EPTypedConfirmation,Resolve-EPExecutable,Get-EPPowerShellExecutableStatus,Get-EPBootstrapRelaunchArguments,
     ConvertTo-EPCloudflareDnsRecordBody,Test-EPCloudflareApiErrorCode,ConvertTo-EPSupabaseConnectionUrlSet,
-    Get-EPReleaseCheckpointName,Assert-EPGitHubWorkflowDisabledState,Invoke-EPR2BucketCleanup,
+    Get-EPReleaseCheckpointName,Assert-EPGitHubWorkflowDisabledState,ConvertFrom-EPD1TimeTravelInfo,Invoke-EPR2BucketCleanup,
     Invoke-EPValidatedSecretPublication

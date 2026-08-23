@@ -930,6 +930,52 @@ Describe 'SHA-scoped release recovery' {
     }
 }
 
+Describe 'D1 Time Travel bookmark capture' {
+    BeforeAll {
+        $script:D1DeploymentSource = Get-Content (Join-Path $script:Root 'Deploy-ElderPath.ps1') -Raw
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($script:D1DeploymentSource,[ref]$tokens,[ref]$errors)
+        if ($errors.Count) { throw "Deploy-ElderPath.ps1 did not parse: $($errors[0].Message)" }
+        $script:D1BookmarkFunction = $ast.Find(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ProductionD1RecoveryBookmark' },
+            $true
+        ).Extent.Text
+    }
+
+    It 'parses and returns only a valid bookmark' {
+        ConvertFrom-EPD1TimeTravelInfo -Json '{"bookmark":"00000000-0000-4000-8000-000000000001"}' |
+            Should -Be '00000000-0000-4000-8000-000000000001'
+    }
+
+    It 'rejects empty, missing, malformed, array, and help-text responses' {
+        foreach ($value in @('', '{}', '{not-json}', '[{"bookmark":"value"}]', 'wrangler d1 time-travel info --help')) {
+            { ConvertFrom-EPD1TimeTravelInfo -Json $value } | Should -Throw '*Production release stopped before migrations*'
+        }
+    }
+
+    It 'rejects non-string and malformed bookmark values' {
+        foreach ($value in @('{"bookmark":123}', '{"bookmark":"   "}', "{`"bookmark`":`"line`nbreak`"}")) {
+            { ConvertFrom-EPD1TimeTravelInfo -Json $value } | Should -Throw '*D1 Time Travel bookmark*'
+        }
+    }
+
+    It 'uses the remote-only command contract without tolerating failure' {
+        $script:D1BookmarkFunction | Should -Match "'d1','time-travel','info'"
+        $script:D1BookmarkFunction | Should -Match "'--env','production','--json'"
+        $script:D1BookmarkFunction | Should -Not -Match "--remote|-AllowFailure"
+        $script:D1BookmarkFunction | Should -Match '\[DRY-RUN-D1-BOOKMARK\]'
+    }
+
+    It 'routes every production bookmark capture through the strict helper' {
+        ($script:D1DeploymentSource | Select-String -Pattern 'Get-ProductionD1RecoveryBookmark' -AllMatches).Matches.Count | Should -Be 4
+        ($script:D1DeploymentSource | Select-String -Pattern "'d1','time-travel','info'" -AllMatches).Matches.Count | Should -Be 1
+        $script:D1DeploymentSource | Should -Not -Match "time-travel[\s\S]{0,160}--remote"
+        $script:D1DeploymentSource | Should -Match "Resources\['D1RecoveryBookmark'\]\s*=\s*Get-ProductionD1RecoveryBookmark"
+        $script:D1DeploymentSource | Should -Match 'Resources\["D1RecoveryBookmark\.\$releaseSha"\]\s*=\s*Get-ProductionD1RecoveryBookmark'
+    }
+}
+
 Describe 'Guarded accidental R2 cleanup' {
     BeforeEach {
         $script:deletedBucket = $null

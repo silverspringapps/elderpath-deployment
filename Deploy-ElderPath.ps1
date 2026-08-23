@@ -68,6 +68,15 @@ function Invoke-Wrangler {
     Invoke-Tool 'npx.cmd' (@('--no-install','wrangler') + $Arguments) -WorkingDirectory $WorkingDirectory -InputText $InputText -Environment $script:CloudflareEnvironment -AllowFailure:$AllowFailure
 }
 
+function Get-ProductionD1RecoveryBookmark {
+    $result = Invoke-Wrangler @(
+        'd1','time-travel','info',(Get-Cfg 'CLOUDFLARE_PRODUCTION_D1_NAME'),
+        '--env','production','--json'
+    )
+    if ($script:DryRun) { return '[DRY-RUN-D1-BOOKMARK]' }
+    return ConvertFrom-EPD1TimeTravelInfo -Json $result.StdOut
+}
+
 function Get-SensitiveValue {
     param([Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)][AllowEmptyString()][string]$Prompt,[switch]$Generate)
     if ($script:Sensitive.ContainsKey($Name)) { return $script:Sensitive[$Name] }
@@ -832,8 +841,7 @@ function Invoke-DeployProductionPhase {
     Invoke-Step 'production.rollback-capture' {
         $project=Get-Cfg 'GCP_PROJECT_ID';$region=Get-Cfg 'GCP_REGION';$service=Get-Cfg 'STATECARE_PRODUCTION_SERVICE'
         $script:State.Resources['PriorCloudRunRevision']=(Invoke-Gcloud @('run','services','describe',$service,'--project',$project,'--region',$region,'--format=value(status.latestReadyRevisionName)') -AllowFailure -NoLogOutput).StdOut.Trim()
-        $bookmark=Invoke-Wrangler @('d1','time-travel','info',(Get-Cfg 'CLOUDFLARE_PRODUCTION_D1_NAME'),'--env','production','--remote') -AllowFailure
-        $script:State.Resources['D1RecoveryBookmark']=(Protect-EPText $bookmark.StdOut.Trim())
+        $script:State.Resources['D1RecoveryBookmark'] = Get-ProductionD1RecoveryBookmark
     }
     Invoke-StateCareDeployStep 'production' 'deploy.statecare.production'
     Invoke-Step 'deploy.worker.production' { Invoke-WorkerDeploy 'production'; $envMap=@{DEPLOYMENT_URL="https://$(Get-Cfg 'PRODUCTION_APP_HOST')"}; Invoke-Npm @('run','smoke:production') -Environment $envMap|Out-Null }
@@ -924,8 +932,7 @@ function Wait-GitHubReleaseRuns([string]$CommitSha) {
     Invoke-Step $rollbackCheckpoint {
         $project=Get-Cfg 'GCP_PROJECT_ID';$region=Get-Cfg 'GCP_REGION';$service=Get-Cfg 'STATECARE_PRODUCTION_SERVICE'
         $script:State.Resources['PriorCloudRunRevision']=(Invoke-Gcloud @('run','services','describe',$service,'--project',$project,'--region',$region,'--format=value(status.latestReadyRevisionName)') -AllowFailure -NoLogOutput).StdOut.Trim()
-        $bookmark=Invoke-Wrangler @('d1','time-travel','info',(Get-Cfg 'CLOUDFLARE_PRODUCTION_D1_NAME'),'--env','production','--remote') -AllowFailure
-        $script:State.Resources['D1RecoveryBookmark']=(Protect-EPText $bookmark.StdOut.Trim())
+        $script:State.Resources['D1RecoveryBookmark'] = Get-ProductionD1RecoveryBookmark
         $worker=Invoke-Wrangler @('deployments','list','--env','production','--json') -AllowFailure
         $script:State.Resources['PriorWorkerDeployments']=(Protect-EPText $worker.StdOut.Trim())
     }
@@ -1178,8 +1185,7 @@ function Invoke-ManualReleasePhase {
 
     $bookmarkCheckpoint = Get-EPReleaseCheckpointName -Category 'manual.production-bookmark' -CommitSha $releaseSha
     Invoke-Step $bookmarkCheckpoint {
-        $bookmark = Invoke-Wrangler @('d1','time-travel','info',(Get-Cfg 'CLOUDFLARE_PRODUCTION_D1_NAME'),'--env','production','--remote')
-        $script:State.Resources["D1RecoveryBookmark.$releaseSha"] = Protect-EPText $bookmark.StdOut.Trim()
+        $script:State.Resources["D1RecoveryBookmark.$releaseSha"] = Get-ProductionD1RecoveryBookmark
     }
     $productionCheckpoint = Get-EPReleaseCheckpointName -Category 'manual.worker.production' -CommitSha $releaseSha
     Invoke-Step $productionCheckpoint {
