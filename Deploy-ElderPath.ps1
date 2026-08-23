@@ -46,10 +46,35 @@ function Invoke-Gcloud { param([string[]]$Arguments,[string]$InputText,[switch]$
 function Invoke-Gh { param([string[]]$Arguments,[string]$InputText,[switch]$AllowFailure,[switch]$NoLogOutput) Invoke-Tool 'gh.exe' $Arguments -InputText $InputText -AllowFailure:$AllowFailure -NoLogOutput:$NoLogOutput }
 function Get-ExecutionRepository { if ($script:ActiveRepository) { return $script:ActiveRepository }; return (Get-Cfg 'ELDERPATH_REPO_PATH') }
 function Invoke-Npm { param([string[]]$Arguments,[hashtable]$Environment=@{},[switch]$AllowFailure) Invoke-Tool 'npm.cmd' $Arguments -WorkingDirectory (Get-ExecutionRepository) -Environment $Environment -AllowFailure:$AllowFailure }
+function Invoke-CloudflareNpm {
+    param([string[]]$Arguments,[switch]$AllowFailure)
+    if (-not $script:CloudflareEnvironment.ContainsKey('CLOUDFLARE_API_TOKEN') -or
+        [string]::IsNullOrWhiteSpace([string]$script:CloudflareEnvironment.CLOUDFLARE_API_TOKEN)) {
+        throw 'Cloudflare authentication is not initialized for this npm command. Rerun the phase and enter the local Cloudflare bootstrap token.'
+    }
+    if (-not $script:CloudflareEnvironment.ContainsKey('CLOUDFLARE_ACCOUNT_ID') -or
+        [string]::IsNullOrWhiteSpace([string]$script:CloudflareEnvironment.CLOUDFLARE_ACCOUNT_ID)) {
+        throw 'Cloudflare account identity is not initialized for this npm command.'
+    }
+    $environment = @{
+        CLOUDFLARE_API_TOKEN = [string]$script:CloudflareEnvironment.CLOUDFLARE_API_TOKEN
+        CLOUDFLARE_ACCOUNT_ID = [string]$script:CloudflareEnvironment.CLOUDFLARE_ACCOUNT_ID
+    }
+    return Invoke-Npm -Arguments $Arguments -Environment $environment -AllowFailure:$AllowFailure
+}
 function Invoke-Wrangler {
     param([string[]]$Arguments,[string]$InputText,[switch]$AllowFailure,[string]$WorkingDirectory)
     if (-not $WorkingDirectory) { $WorkingDirectory = Get-ExecutionRepository }
     Invoke-Tool 'npx.cmd' (@('--no-install','wrangler') + $Arguments) -WorkingDirectory $WorkingDirectory -InputText $InputText -Environment $script:CloudflareEnvironment -AllowFailure:$AllowFailure
+}
+
+function Get-ProductionD1RecoveryBookmark {
+    $result = Invoke-Wrangler @(
+        'd1','time-travel','info',(Get-Cfg 'CLOUDFLARE_PRODUCTION_D1_NAME'),
+        '--env','production','--json'
+    )
+    if ($script:DryRun) { return '[DRY-RUN-D1-BOOKMARK]' }
+    return ConvertFrom-EPD1TimeTravelInfo -Json $result.StdOut
 }
 
 function Get-SensitiveValue {
@@ -757,7 +782,9 @@ function Invoke-WorkerDeploy([string]$EnvironmentName) {
     if($RotateSecrets -or -not(Test-EPCheckpointComplete $script:State $secretCheckpoint)){Set-WorkerSecrets $EnvironmentName;if(-not$script:DryRun){Complete-Step $secretCheckpoint}}
     $migration=if($EnvironmentName-eq'production'){'db:migrate:production'}else{'db:migrate:staging'}
     $seed=if($EnvironmentName-eq'production'){'db:seed:production'}else{'db:seed:staging'}
-    Invoke-Npm @('run',$migration)|Out-Null; Invoke-Npm @('run',$seed)|Out-Null; Invoke-Npm @('run',"deploy:$EnvironmentName")|Out-Null
+    Invoke-CloudflareNpm @('run',$migration)|Out-Null
+    Invoke-CloudflareNpm @('run',$seed)|Out-Null
+    Invoke-CloudflareNpm @('run',"deploy:$EnvironmentName")|Out-Null
     Test-WorkerDeployment $EnvironmentName
 }
 
@@ -814,8 +841,7 @@ function Invoke-DeployProductionPhase {
     Invoke-Step 'production.rollback-capture' {
         $project=Get-Cfg 'GCP_PROJECT_ID';$region=Get-Cfg 'GCP_REGION';$service=Get-Cfg 'STATECARE_PRODUCTION_SERVICE'
         $script:State.Resources['PriorCloudRunRevision']=(Invoke-Gcloud @('run','services','describe',$service,'--project',$project,'--region',$region,'--format=value(status.latestReadyRevisionName)') -AllowFailure -NoLogOutput).StdOut.Trim()
-        $bookmark=Invoke-Wrangler @('d1','time-travel','info',(Get-Cfg 'CLOUDFLARE_PRODUCTION_D1_NAME'),'--env','production','--remote') -AllowFailure
-        $script:State.Resources['D1RecoveryBookmark']=(Protect-EPText $bookmark.StdOut.Trim())
+        $script:State.Resources['D1RecoveryBookmark'] = Get-ProductionD1RecoveryBookmark
     }
     Invoke-StateCareDeployStep 'production' 'deploy.statecare.production'
     Invoke-Step 'deploy.worker.production' { Invoke-WorkerDeploy 'production'; $envMap=@{DEPLOYMENT_URL="https://$(Get-Cfg 'PRODUCTION_APP_HOST')"}; Invoke-Npm @('run','smoke:production') -Environment $envMap|Out-Null }
@@ -906,8 +932,7 @@ function Wait-GitHubReleaseRuns([string]$CommitSha) {
     Invoke-Step $rollbackCheckpoint {
         $project=Get-Cfg 'GCP_PROJECT_ID';$region=Get-Cfg 'GCP_REGION';$service=Get-Cfg 'STATECARE_PRODUCTION_SERVICE'
         $script:State.Resources['PriorCloudRunRevision']=(Invoke-Gcloud @('run','services','describe',$service,'--project',$project,'--region',$region,'--format=value(status.latestReadyRevisionName)') -AllowFailure -NoLogOutput).StdOut.Trim()
-        $bookmark=Invoke-Wrangler @('d1','time-travel','info',(Get-Cfg 'CLOUDFLARE_PRODUCTION_D1_NAME'),'--env','production','--remote') -AllowFailure
-        $script:State.Resources['D1RecoveryBookmark']=(Protect-EPText $bookmark.StdOut.Trim())
+        $script:State.Resources['D1RecoveryBookmark'] = Get-ProductionD1RecoveryBookmark
         $worker=Invoke-Wrangler @('deployments','list','--env','production','--json') -AllowFailure
         $script:State.Resources['PriorWorkerDeployments']=(Protect-EPText $worker.StdOut.Trim())
     }
@@ -1111,11 +1136,11 @@ function Invoke-TaggedWorkerRelease(
     Set-WorkerSecret $EnvironmentName 'STATECARE_REGISTRY_API_KEY' $registryKey
     $migration = if ($EnvironmentName -eq 'production') { 'db:migrate:production' } else { 'db:migrate:staging' }
     $seed = if ($EnvironmentName -eq 'production') { 'db:seed:production' } else { 'db:seed:staging' }
-    Invoke-Npm @('run',$migration) | Out-Null
-    Invoke-Npm @('run',$seed) | Out-Null
+    Invoke-CloudflareNpm @('run',$migration) | Out-Null
+    Invoke-CloudflareNpm @('run',$seed) | Out-Null
     $tag = "release-$($CommitSha.Substring(0,12))"
     $message = "ElderPath release $CommitSha"
-    Invoke-Npm @('run',"deploy:$EnvironmentName",'--','--tag',$tag,'--message',$message) | Out-Null
+    Invoke-CloudflareNpm @('run',"deploy:$EnvironmentName",'--','--tag',$tag,'--message',$message) | Out-Null
     Test-WorkerDeployment $EnvironmentName
     Invoke-Npm @('run','smoke:browser') -Environment @{ DEPLOYMENT_URL="https://$(Get-Cfg "${tier}_APP_HOST")" } | Out-Null
     Test-WorkerRegistryDiagnostics $EnvironmentName
@@ -1160,8 +1185,7 @@ function Invoke-ManualReleasePhase {
 
     $bookmarkCheckpoint = Get-EPReleaseCheckpointName -Category 'manual.production-bookmark' -CommitSha $releaseSha
     Invoke-Step $bookmarkCheckpoint {
-        $bookmark = Invoke-Wrangler @('d1','time-travel','info',(Get-Cfg 'CLOUDFLARE_PRODUCTION_D1_NAME'),'--env','production','--remote')
-        $script:State.Resources["D1RecoveryBookmark.$releaseSha"] = Protect-EPText $bookmark.StdOut.Trim()
+        $script:State.Resources["D1RecoveryBookmark.$releaseSha"] = Get-ProductionD1RecoveryBookmark
     }
     $productionCheckpoint = Get-EPReleaseCheckpointName -Category 'manual.worker.production' -CommitSha $releaseSha
     Invoke-Step $productionCheckpoint {

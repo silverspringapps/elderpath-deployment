@@ -306,7 +306,7 @@ C:\Scripts\Git\elderpath-deployment\state\deployment-state.json
 C:\Scripts\Git\elderpath-deployment\logs\
 ```
 
-The checkpoint records prior Cloud Run revision and the D1 Time Travel output before production. On a bad release:
+The checkpoint records the prior Cloud Run revision and a validated D1 Time Travel bookmark before production. Bookmark capture fails closed before migrations if Wrangler returns an error or malformed JSON. On a bad release:
 
 1. Stop promotion and preserve logs/request IDs.
 2. Route Cloud Run back to the recorded prior revision and roll back the Worker deployment first.

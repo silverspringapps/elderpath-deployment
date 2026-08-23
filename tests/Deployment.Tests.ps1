@@ -364,6 +364,36 @@ Describe 'Secret handling' {
         $captured | Should -Not -Match ([regex]::Escape($secret))
     }
 
+    It 'passes a registered secret through the child environment without logging it' {
+        $secret = 'child-environment-secret'
+        Add-EPRedaction $secret
+        $captured = (& {
+            $result = Invoke-EPCommand -FilePath 'pwsh' -ArgumentList @(
+                '-NoProfile',
+                '-Command',
+                "if (`$env:EP_ENVIRONMENT_TEST -eq '$secret') { 'environment-present' } else { exit 9 }"
+            ) -Environment @{ EP_ENVIRONMENT_TEST = $secret } -NoLogOutput
+            $result.ExitCode | Should -Be 0
+            $result.StdOut.Trim() | Should -Be 'environment-present'
+        } 6>&1 | Out-String)
+        $captured | Should -Not -Match ([regex]::Escape($secret))
+    }
+
+    It 'redacts a registered environment secret from failed child diagnostics' {
+        $secret = 'failed-child-environment-secret'
+        Add-EPRedaction $secret
+        $captured = (& {
+            $result = Invoke-EPCommand -FilePath 'pwsh' -ArgumentList @(
+                '-NoProfile',
+                '-Command',
+                '[Console]::Error.WriteLine($env:EP_ENVIRONMENT_TEST); exit 7'
+            ) -Environment @{ EP_ENVIRONMENT_TEST = $secret } -AllowFailure -NoLogOutput
+            $result.ExitCode | Should -Be 7
+        } 6>&1 | Out-String)
+        $captured | Should -Not -Match ([regex]::Escape($secret))
+        $captured | Should -Match '\[REDACTED\]'
+    }
+
     It 'returns and redacts a securely prompted value' {
         Mock Read-Host -ModuleName ElderPath.Deployment {
             $secureValue = [System.Security.SecureString]::new()
@@ -548,6 +578,14 @@ Describe 'GitHub Free private-repository deployment' {
             { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-TaggedWorkerRelease' },
             $true
         ).Extent.Text
+        $script:CloudflareNpmFunction = $ast.Find(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-CloudflareNpm' },
+            $true
+        ).Extent.Text
+        $script:WorkerDeployFunction = $ast.Find(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-WorkerDeploy' },
+            $true
+        ).Extent.Text
         $script:ReleaseBranchesFunction = $ast.Find(
             { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-ReleaseTopologyBranchState' },
             $true
@@ -662,6 +700,20 @@ Describe 'GitHub Free private-repository deployment' {
         $script:TaggedWorkerReleaseFunction | Should -Match "'deployments','status'"
         $script:TaggedWorkerReleaseFunction | Should -Match 'Test-WorkerRegistryDiagnostics'
         $script:TaggedWorkerReleaseFunction | Should -Not -Match 'BETTER_AUTH_SECRET|RESEND_API_KEY|OPENAI_API_KEY'
+    }
+
+    It 'passes in-memory Cloudflare authentication to every Worker npm mutation' {
+        $script:CloudflareNpmFunction | Should -Match "ContainsKey\('CLOUDFLARE_API_TOKEN'\)"
+        $script:CloudflareNpmFunction | Should -Match "ContainsKey\('CLOUDFLARE_ACCOUNT_ID'\)"
+        $script:CloudflareNpmFunction | Should -Match 'Cloudflare authentication is not initialized'
+        $script:CloudflareNpmFunction | Should -Match 'Invoke-Npm[\s\S]*-Environment \$environment'
+        ($script:WorkerDeployFunction | Select-String -Pattern 'Invoke-CloudflareNpm' -AllMatches).Matches.Count | Should -Be 3
+        ($script:TaggedWorkerReleaseFunction | Select-String -Pattern 'Invoke-CloudflareNpm' -AllMatches).Matches.Count | Should -Be 3
+        $script:TaggedWorkerReleaseFunction | Should -Match "Invoke-Npm @\('run','smoke:browser'\) -Environment"
+        $missingAuthenticationProbe = [scriptblock]::Create(
+            "$($script:CloudflareNpmFunction)`n`$script:CloudflareEnvironment = @{}; Invoke-CloudflareNpm @('run','noop')"
+        )
+        { & $missingAuthenticationProbe } | Should -Throw '*Cloudflare authentication is not initialized*'
     }
 
     It 'requires an ancestor dev branch and exact confirmation before one-time synchronization' {
@@ -875,6 +927,52 @@ Describe 'SHA-scoped release recovery' {
         $source | Should -Match 'Get-EPReleaseCheckpointName -Category "github\.run\.'
         $source | Should -Match 'github\.production\.dispatched''.*-CommitSha \$CommitSha'
         $source | Should -Match 'origin/\$defaultBranch advanced from release'
+    }
+}
+
+Describe 'D1 Time Travel bookmark capture' {
+    BeforeAll {
+        $script:D1DeploymentSource = Get-Content (Join-Path $script:Root 'Deploy-ElderPath.ps1') -Raw
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($script:D1DeploymentSource,[ref]$tokens,[ref]$errors)
+        if ($errors.Count) { throw "Deploy-ElderPath.ps1 did not parse: $($errors[0].Message)" }
+        $script:D1BookmarkFunction = $ast.Find(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ProductionD1RecoveryBookmark' },
+            $true
+        ).Extent.Text
+    }
+
+    It 'parses and returns only a valid bookmark' {
+        ConvertFrom-EPD1TimeTravelInfo -Json '{"bookmark":"00000000-0000-4000-8000-000000000001"}' |
+            Should -Be '00000000-0000-4000-8000-000000000001'
+    }
+
+    It 'rejects empty, missing, malformed, array, and help-text responses' {
+        foreach ($value in @('', '{}', '{not-json}', '[{"bookmark":"value"}]', 'wrangler d1 time-travel info --help')) {
+            { ConvertFrom-EPD1TimeTravelInfo -Json $value } | Should -Throw '*Production release stopped before migrations*'
+        }
+    }
+
+    It 'rejects non-string and malformed bookmark values' {
+        foreach ($value in @('{"bookmark":123}', '{"bookmark":"   "}', "{`"bookmark`":`"line`nbreak`"}")) {
+            { ConvertFrom-EPD1TimeTravelInfo -Json $value } | Should -Throw '*D1 Time Travel bookmark*'
+        }
+    }
+
+    It 'uses the remote-only command contract without tolerating failure' {
+        $script:D1BookmarkFunction | Should -Match "'d1','time-travel','info'"
+        $script:D1BookmarkFunction | Should -Match "'--env','production','--json'"
+        $script:D1BookmarkFunction | Should -Not -Match "--remote|-AllowFailure"
+        $script:D1BookmarkFunction | Should -Match '\[DRY-RUN-D1-BOOKMARK\]'
+    }
+
+    It 'routes every production bookmark capture through the strict helper' {
+        ($script:D1DeploymentSource | Select-String -Pattern 'Get-ProductionD1RecoveryBookmark' -AllMatches).Matches.Count | Should -Be 4
+        ($script:D1DeploymentSource | Select-String -Pattern "'d1','time-travel','info'" -AllMatches).Matches.Count | Should -Be 1
+        $script:D1DeploymentSource | Should -Not -Match "time-travel[\s\S]{0,160}--remote"
+        $script:D1DeploymentSource | Should -Match "Resources\['D1RecoveryBookmark'\]\s*=\s*Get-ProductionD1RecoveryBookmark"
+        $script:D1DeploymentSource | Should -Match 'Resources\["D1RecoveryBookmark\.\$releaseSha"\]\s*=\s*Get-ProductionD1RecoveryBookmark'
     }
 }
 
