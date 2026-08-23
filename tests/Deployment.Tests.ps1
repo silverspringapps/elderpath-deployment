@@ -364,6 +364,36 @@ Describe 'Secret handling' {
         $captured | Should -Not -Match ([regex]::Escape($secret))
     }
 
+    It 'passes a registered secret through the child environment without logging it' {
+        $secret = 'child-environment-secret'
+        Add-EPRedaction $secret
+        $captured = (& {
+            $result = Invoke-EPCommand -FilePath 'pwsh' -ArgumentList @(
+                '-NoProfile',
+                '-Command',
+                "if (`$env:EP_ENVIRONMENT_TEST -eq '$secret') { 'environment-present' } else { exit 9 }"
+            ) -Environment @{ EP_ENVIRONMENT_TEST = $secret } -NoLogOutput
+            $result.ExitCode | Should -Be 0
+            $result.StdOut.Trim() | Should -Be 'environment-present'
+        } 6>&1 | Out-String)
+        $captured | Should -Not -Match ([regex]::Escape($secret))
+    }
+
+    It 'redacts a registered environment secret from failed child diagnostics' {
+        $secret = 'failed-child-environment-secret'
+        Add-EPRedaction $secret
+        $captured = (& {
+            $result = Invoke-EPCommand -FilePath 'pwsh' -ArgumentList @(
+                '-NoProfile',
+                '-Command',
+                '[Console]::Error.WriteLine($env:EP_ENVIRONMENT_TEST); exit 7'
+            ) -Environment @{ EP_ENVIRONMENT_TEST = $secret } -AllowFailure -NoLogOutput
+            $result.ExitCode | Should -Be 7
+        } 6>&1 | Out-String)
+        $captured | Should -Not -Match ([regex]::Escape($secret))
+        $captured | Should -Match '\[REDACTED\]'
+    }
+
     It 'returns and redacts a securely prompted value' {
         Mock Read-Host -ModuleName ElderPath.Deployment {
             $secureValue = [System.Security.SecureString]::new()
@@ -548,6 +578,14 @@ Describe 'GitHub Free private-repository deployment' {
             { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-TaggedWorkerRelease' },
             $true
         ).Extent.Text
+        $script:CloudflareNpmFunction = $ast.Find(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-CloudflareNpm' },
+            $true
+        ).Extent.Text
+        $script:WorkerDeployFunction = $ast.Find(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-WorkerDeploy' },
+            $true
+        ).Extent.Text
         $script:ReleaseBranchesFunction = $ast.Find(
             { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-ReleaseTopologyBranchState' },
             $true
@@ -662,6 +700,20 @@ Describe 'GitHub Free private-repository deployment' {
         $script:TaggedWorkerReleaseFunction | Should -Match "'deployments','status'"
         $script:TaggedWorkerReleaseFunction | Should -Match 'Test-WorkerRegistryDiagnostics'
         $script:TaggedWorkerReleaseFunction | Should -Not -Match 'BETTER_AUTH_SECRET|RESEND_API_KEY|OPENAI_API_KEY'
+    }
+
+    It 'passes in-memory Cloudflare authentication to every Worker npm mutation' {
+        $script:CloudflareNpmFunction | Should -Match "ContainsKey\('CLOUDFLARE_API_TOKEN'\)"
+        $script:CloudflareNpmFunction | Should -Match "ContainsKey\('CLOUDFLARE_ACCOUNT_ID'\)"
+        $script:CloudflareNpmFunction | Should -Match 'Cloudflare authentication is not initialized'
+        $script:CloudflareNpmFunction | Should -Match 'Invoke-Npm[\s\S]*-Environment \$environment'
+        ($script:WorkerDeployFunction | Select-String -Pattern 'Invoke-CloudflareNpm' -AllMatches).Matches.Count | Should -Be 3
+        ($script:TaggedWorkerReleaseFunction | Select-String -Pattern 'Invoke-CloudflareNpm' -AllMatches).Matches.Count | Should -Be 3
+        $script:TaggedWorkerReleaseFunction | Should -Match "Invoke-Npm @\('run','smoke:browser'\) -Environment"
+        $missingAuthenticationProbe = [scriptblock]::Create(
+            "$($script:CloudflareNpmFunction)`n`$script:CloudflareEnvironment = @{}; Invoke-CloudflareNpm @('run','noop')"
+        )
+        { & $missingAuthenticationProbe } | Should -Throw '*Cloudflare authentication is not initialized*'
     }
 
     It 'requires an ancestor dev branch and exact confirmation before one-time synchronization' {
